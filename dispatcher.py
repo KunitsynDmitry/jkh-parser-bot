@@ -1,9 +1,16 @@
 """
-Мини-LangGraph для ЖКХ-диспетчера.
-Граф: Extractor -> QualityGate -> END
-MemorySaver хранит состояние в RAM для будущих многошаговых диалогов.
+Граф обработки жалобы ЖКХ.
+
+Узлы (Nodes):
+  1. RateLimiter   — защита от спама
+  2. Extractor     — вызов Pydantic-агента (DeepSeek)
+  3. QualityGate   — проверка результата, роутинг ответа
+
+Поток:
+  user_input → RateLimiter → Extractor → QualityGate → END
 """
 import hashlib
+import time
 from datetime import datetime
 from typing import TypedDict
 
@@ -18,9 +25,9 @@ from pydantic_ai.providers.deepseek import DeepSeekProvider
 from config import DEEPSEEK_API_KEY
 
 
-# ==========================================
-# 1. СХЕМА ДАННЫХ (без изменений)
-# ==========================================
+# ═══════════════════════════════════════════
+# 1. СХЕМА ДАННЫХ
+# ═══════════════════════════════════════════
 class SingleIssue(BaseModel):
     category: str = Field(description="Категория (строго одна из): Водоснабжение, Отопление, Электрика, Лифт, Общедомовое имущество, Двор")
     urgency_level: str = Field(description="Уровень срочности: Низкий, Средний, Высокий, Критический")
@@ -65,9 +72,9 @@ class ComplaintReport(BaseModel):
     non_jkh_issues: list[str] = Field(default_factory=list, description="Проблемы из сообщения, НЕ относящиеся к ЖКХ")
 
 
-# ==========================================
+# ═══════════════════════════════════════════
 # 2. PYDANTIC-АГЕНТ
-# ==========================================
+# ═══════════════════════════════════════════
 deepseek_model = OpenAIChatModel(
     model_name='deepseek-chat',
     provider=DeepSeekProvider(api_key=DEEPSEEK_API_KEY)
@@ -91,49 +98,69 @@ def dynamic_prompt(ctx: RunContext[str]) -> str:
         f"ID заявителя для отчета: {ctx.deps}. "
         "Если в тексте описано несколько разных проблем — создай для каждой отдельный элемент в списке issues. "
         "ВНИМАНИЕ НА ЛОКАЦИЮ: в location_details указывай МЕСТО ПРОБЛЕМЫ, а не адрес заявителя. "
-        "Если автор пишет «я живу на 5 этаже, а сосед снизу сверлит потолок» — проблема на 4 этаже (этажом ниже), "
-        "а НЕ на 5-м. «Сосед сверху заливает» — проблема этажом ВЫШЕ автора. "
-        "«Сосед по стояку», «за стеной», «в соседнем подъезде» — вычисляй точный адрес проблемы относительно автора. "
+        "Если автор пишет «я живу на 5 этаже, а сосед снизу сверлит потолок» — проблема на 4 этаже (этажом ниже). "
+        "«Сосед сверху заливает» — проблема этажом ВЫШЕ автора. "
         "Категории проблем строго: Водоснабжение, Отопление, Электрика, Лифт, Общедомовое имущество, Двор. "
-        "Общедомовое имущество — это повреждения стен, перекрытий, потолков, пола, сверление, штробление, резка несущих конструкций, "
-        "трещины, протечки кровли, подтопление подвала, разрушение фасада. "
-        "КРИТИЧНО: сверление потолка/стен, резка болгаркой, штробы в перекрытиях — это повреждение общедомового имущества, "
-        "относится к ЖКХ, а НЕ к полиции. ВСЕГДА выделяй такие проблемы в отдельный issue. "
-        "ВАЖНО: если сообщение содержит ТОЛЬКО криминал/поведение жильцов (драки, наркотики, алкоголь, избиения, шум, музыка) "
+        "Общедомовое имущество — повреждения стен, перекрытий, потолков, пола, сверление, штробление, резка несущих конструкций. "
+        "КРИТИЧНО: сверление потолка/стен, резка болгаркой — это повреждение общедомового имущества, относится к ЖКХ. "
+        "ВАЖНО: если сообщение содержит ТОЛЬКО криминал (драки, наркотики, алкоголь, избиения, шум, музыка) "
         "без проблем ЖКХ — верни ПУСТОЙ список issues. "
-        "Если в сообщении есть И жкх-проблемы, И не-жкх — жкх помести в issues, а не-жкх перечисли в non_jkh_issues краткими фразами. "
-        "Не выдумывай проблемы, если их нет в компетенции ЖКХ."
+        "Если есть И жкх-проблемы, И не-жкх — жкх в issues, не-жкх в non_jkh_issues краткими фразами."
     )
 
 
-# ==========================================
+# ═══════════════════════════════════════════
 # 3. СОСТОЯНИЕ ГРАФА
-# ==========================================
+# ═══════════════════════════════════════════
 class AgentState(TypedDict, total=False):
     user_input: str
     applicant_hash: str
     complaint: ComplaintReport | None
     needs_clarification: bool
     reply_message: str
+    blocked: bool  # rate limiter flag
 
 
-# ==========================================
+# ═══════════════════════════════════════════
 # 4. УЗЛЫ ГРАФА
-# ==========================================
+# ═══════════════════════════════════════════
+RATE_LIMIT_SEC = 3
+_user_last_request: dict[str, float] = {}
+
+
+def node_rate_limiter(state: AgentState) -> AgentState:
+    """Защита от спама: не чаще RATE_LIMIT_SEC на пользователя."""
+    now = time.time()
+    user_key = state.get("applicant_hash", "anon")
+    last = _user_last_request.get(user_key, 0)
+
+    if now - last < RATE_LIMIT_SEC:
+        return {
+            **state,
+            "blocked": True,
+            "reply_message": "⏳ Слишком много запросов. Подождите немного.",
+        }
+
+    _user_last_request[user_key] = now
+    return {**state, "blocked": False}
+
+
 def node_extractor(state: AgentState) -> AgentState:
-    """Вызывает Pydantic-агента и кладёт результат в состояние."""
+    """Вызывает Pydantic-агента (DeepSeek) и кладёт результат в состояние."""
+    if state.get("blocked"):
+        return state
+
     result = agent.run_sync(state["user_input"], deps=state["applicant_hash"])
-    return {
-        **state,
-        "complaint": result.output,
-    }
+    return {**state, "complaint": result.output}
 
 
 def node_quality_gate(state: AgentState) -> AgentState:
-    """Проверяет качество результата и решает: отдать JSON или запросить уточнение."""
-    complaint = state["complaint"]
+    """Проверяет качество: отдать JSON / запросить уточнение / отклонить."""
+    if state.get("blocked"):
+        return state
 
-    # Случай 1: пустой тикет — не ЖКХ
+    complaint = state.get("complaint")
+
     if not complaint or not complaint.issues:
         return {
             **state,
@@ -146,7 +173,6 @@ def node_quality_gate(state: AgentState) -> AgentState:
             ),
         }
 
-    # Случай 2: не хватает локации
     missing_locations = [
         f"• {issue.dry_summary}"
         for issue in complaint.issues
@@ -163,7 +189,6 @@ def node_quality_gate(state: AgentState) -> AgentState:
             ),
         }
 
-    # Случай 3: всё хорошо — формируем JSON
     json_str = complaint.model_dump_json(indent=2, exclude={"non_jkh_issues"})
     reply = f"📑 **Тикет сформирован:**\n\n```json\n{json_str}\n```"
 
@@ -171,54 +196,47 @@ def node_quality_gate(state: AgentState) -> AgentState:
         note = "\n".join(f"• {item}" for item in complaint.non_jkh_issues)
         reply += f"\n\n⚠️ *Описанные ниже проблемы не относятся к ЖКХ. Для их решения обратитесь в другие службы (полиция, администрация):*\n{note}"
 
-    return {
-        **state,
-        "needs_clarification": False,
-        "reply_message": reply,
-    }
+    return {**state, "needs_clarification": False, "reply_message": reply}
 
 
-# ==========================================
+# ═══════════════════════════════════════════
 # 5. СБОРКА ГРАФА
-# ==========================================
-def build_graph() -> StateGraph:
+# ═══════════════════════════════════════════
+def _build_graph() -> StateGraph:
     builder = StateGraph(AgentState)
 
+    builder.add_node("rate_limiter", node_rate_limiter)
     builder.add_node("extractor", node_extractor)
     builder.add_node("quality_gate", node_quality_gate)
 
-    builder.set_entry_point("extractor")
+    builder.set_entry_point("rate_limiter")
+    builder.add_edge("rate_limiter", "extractor")
     builder.add_edge("extractor", "quality_gate")
     builder.add_edge("quality_gate", END)
 
     serde = JsonPlusSerializer(
-        allowed_msgpack_modules=[("graph_agent", "ComplaintReport")]
+        allowed_msgpack_modules=[("dispatcher", "ComplaintReport")]
     )
     memory = MemorySaver(serde=serde)
     return builder.compile(checkpointer=memory)
 
 
-# Экземпляр графа (синглтон)
-graph = build_graph()
+_graph = _build_graph()
 
 
-# ==========================================
-# 6. ТОЧКА ВХОДА ДЛЯ БОТА
-# ==========================================
+# ═══════════════════════════════════════════
+# 6. ТОЧКА ВХОДА ДЛЯ ТРАНСПОРТА
+# ═══════════════════════════════════════════
 def process_message(text: str, telegram_user_id: int) -> str:
     """
-    Вызывается из bot.py на каждое сообщение.
+    Единственная публичная функция.
+    Вызывается транспортом (main.py) на каждое сообщение.
     Возвращает строку-ответ для отправки пользователю.
     """
     applicant_hash = hashlib.sha256(str(telegram_user_id).encode()).hexdigest()[:12]
-    thread_id = str(telegram_user_id)
 
-    result = graph.invoke(
-        {
-            "user_input": text,
-            "applicant_hash": applicant_hash,
-        },
-        config={"configurable": {"thread_id": thread_id}},
+    result = _graph.invoke(
+        {"user_input": text, "applicant_hash": applicant_hash},
+        config={"configurable": {"thread_id": str(telegram_user_id)}},
     )
-
     return result["reply_message"]
