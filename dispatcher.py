@@ -114,6 +114,7 @@ def dynamic_prompt(ctx: RunContext[str]) -> str:
 # ═══════════════════════════════════════════
 class AgentState(TypedDict, total=False):
     user_input: str
+    accumulated_context: str  # полный контекст диалога (исходная жалоба + уточнения)
     applicant_hash: str
     complaint: ComplaintReport | None
     needs_clarification: bool
@@ -150,7 +151,8 @@ def node_extractor(state: AgentState) -> AgentState:
     if state.get("blocked"):
         return state
 
-    result = agent.run_sync(state["user_input"], deps=state["applicant_hash"])
+    text = state.get("accumulated_context") or state["user_input"]
+    result = agent.run_sync(text, deps=state["applicant_hash"])
     return {**state, "complaint": result.output}
 
 
@@ -234,9 +236,21 @@ def process_message(text: str, telegram_user_id: int) -> str:
     Возвращает строку-ответ для отправки пользователю.
     """
     applicant_hash = hashlib.sha256(str(telegram_user_id).encode()).hexdigest()[:12]
+    thread_cfg = {"configurable": {"thread_id": str(telegram_user_id)}}
+
+    # Склеиваем контекст, если предыдущий шаг запросил уточнение
+    accumulated = text
+    try:
+        prev_state = _graph.get_state(thread_cfg)
+        if prev_state and prev_state.values:
+            if prev_state.values.get("needs_clarification"):
+                old_context = prev_state.values.get("accumulated_context") or prev_state.values.get("user_input") or ""
+                accumulated = f"{old_context}\nУточнение от жильца: {text}"
+    except Exception:
+        pass  # первый запуск для этого thread_id — состояния ещё нет
 
     result = _graph.invoke(
-        {"user_input": text, "applicant_hash": applicant_hash},
-        config={"configurable": {"thread_id": str(telegram_user_id)}},
+        {"user_input": text, "accumulated_context": accumulated, "applicant_hash": applicant_hash},
+        config=thread_cfg,
     )
     return result["reply_message"]
