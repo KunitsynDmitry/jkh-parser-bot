@@ -88,10 +88,12 @@ class SingleIssue(BaseModel):
                 self.location_details = 'Требуется уточнение'
 
         if self.problem_scope == "Подъезд/Этаж":
-            # Цифры или русские порядковые числительные (второй, третьего, etc.)
+            # Цифры или русские порядковые числительные (второй подъезд / 2-й подъезд / подъезд 2)
             _ord = r'(?:перв|втор|трет|четв[её]рт|пят|шест|седьм|восьм|девят|десят|одиннадцат|двенадцат|тринадцат|четырнадцат|пятнадцат|шестнадцат|семнадцат|восемнадцат|девятнадцат|двадцат)'
-            has_entrance = bool(re.search(rf'подъезд\s*(\d+|{_ord})', self.location_details.lower()))
-            has_floor = bool(re.search(rf'этаж\s*(\d+|{_ord})', self.location_details.lower()))
+            _ent = rf'(?:подъезд\s*(\d+|{_ord}))|(?:(\d+|{_ord})\S{{0,5}}\s*подъезд)'
+            _flr = rf'(?:этаж\s*(\d+|{_ord}))|(?:(\d+|{_ord})\S{{0,5}}\s*этаж)'
+            has_entrance = bool(re.search(_ent, self.location_details.lower()))
+            has_floor = bool(re.search(_flr, self.location_details.lower()))
             if not (has_entrance or has_floor):
                 self.location_details = 'Требуется уточнение'
 
