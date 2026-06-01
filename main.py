@@ -2,7 +2,10 @@
 import telebot
 
 from config import TG_TOKEN
+from db import init_db
 from dispatcher import process_message
+
+init_db()
 
 bot = telebot.TeleBot(TG_TOKEN)
 
